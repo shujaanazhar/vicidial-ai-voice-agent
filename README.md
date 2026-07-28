@@ -32,7 +32,7 @@ wired in last.
 | Layer | Tool | Runs on |
 |-------|------|---------|
 | STT | faster-whisper (`small.en`) | GPU |
-| LLM | Ollama (`llama3.2:3b`; `qwen2.5:7b` for quality) | GPU |
+| LLM | Ollama (`qwen2.5:7b`; `llama3.2:3b` is faster but less reliable) | GPU |
 | TTS | Piper (`en_US-lessac-medium`) | CPU |
 | VAD | energy-based, adaptive noise floor | CPU |
 
@@ -131,7 +131,7 @@ asterisk/sip_ai_test.conf        chan_sip peer for the test softphone
 
 ## Measured latency
 
-RTX 4060 8 GB, `small.en` + `llama3.2:3b`:
+RTX 4060 8 GB, `small.en` + `qwen2.5:7b` (both resident on GPU, 5.6/8 GB):
 
 | Stage | Time |
 |-------|------|
@@ -150,9 +150,10 @@ whole reply already sitting in Asterisk's buffer).
 
 ## Known limitations
 
-- **`llama3.2:3b` invents plausible generic facts.** It correctly refuses to
-  invent an account balance, then happily makes up business hours. Prompting
-  alone does not close this; it needs grounding or a stronger model.
+- **The model still invents facts, and a bigger model only moves the problem.**
+  `llama3.2:3b` made up business hours; `qwen2.5:7b` stopped doing that but then
+  asserted a completely invented description of the company. Neither can be
+  prompted into reliability. This needs grounding, not a model swap.
 - **Barge-in is only tested with a headset.** With open speakers the agent's own
   voice can re-enter the mic and self-trigger it. There is a 250 ms grace window
   and a stricter threshold, but it is untested.
