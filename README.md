@@ -108,8 +108,10 @@ scripts/make_test_audio.py       generates the simulated-caller WAVs
 requirements.txt                 pinned host Python deps
 host_ai/ai_agent.py              the agent: VAD→STT→LLM→TTS + barge-in
 host_ai/run_agent.sh             launcher (sets the LD_LIBRARY_PATH CTranslate2 needs)
+host_ai/outbound.py              P4b outbound dialer: AMI Originate + call outcomes
 host_ai/audiosocket_echo.py      echo server — proves the audio pipe in isolation
-asterisk/extensions_ai.conf      dialplan: route ext 5000 to AudioSocket
+asterisk/extensions_ai.conf      dialplan: route inbound ext 5000 to AudioSocket
+asterisk/extensions_ai_outbound.conf  dialplan: outbound ext 5001 + scripted answerer
 asterisk/extensions_ai_test.conf test harness: drive the agent with no softphone
 asterisk/sip_ai_test.conf        chan_sip peer for the test softphone
 ```
@@ -123,8 +125,8 @@ asterisk/sip_ai_test.conf        chan_sip peer for the test softphone
 | P1 | Prove SIP: softphone registers, real voice call | **done** |
 | P2 | AudioSocket echo POC (prove host↔Asterisk audio) | **done** — 808 frames echoed |
 | P3 | AI pipeline: VAD→STT→LLM→TTS + barge-in | **done** |
-| P4a | **Inbound** feature: inbound route → AI answers | next |
-| P4b | **Outbound** feature: Originate/dialer → bridge AI | next |
+| P4a | **Inbound** feature: inbound route → AI answers | **done** — ext 5000 |
+| P4b | **Outbound** feature: Originate/dialer → bridge AI | **done** — `host_ai/outbound.py`, ext 5001 |
 | P5 | Wire into VICIdial (in-groups, campaigns, dispositions) | after P4 |
 
 ## Measured latency
@@ -157,6 +159,10 @@ whole reply already sitting in Asterisk's buffer).
 - The agent offers to "pass you to a representative" but cannot yet — that
   arrives with P5.
 - English only (`small.en`, `en_US-lessac-medium`).
+- **Outbound invents a reason for calling.** The opening line is fixed, but the
+  model's follow-up made up a pretext ("I called to check in on your account").
+  The call's purpose has to be injected from campaign/lead data, not left to the
+  model. That arrives with P5.
 
 ## Security note
 

@@ -96,6 +96,31 @@ MAX_REPLY_SENTENCES = 2            # it ran to four on a phone call otherwise
 MAX_REPLY_CHARS = 320              # backstop for a comma-spliced ramble that never
                                    # reaches a full stop
 GREETING = f"Hi, this is {AGENT_NAME}, an AI assistant at {COMPANY}. How can I help?"
+
+# Outbound is a different job: we placed the call, so we open the conversation,
+# say who we are and why we rang, and take "no" for an answer. Disclosing that
+# this is an automated AI call up front is a legal requirement for outbound
+# dialing in many jurisdictions, not a nicety.
+OUTBOUND_GREETING = (
+    f"Hello, this is {AGENT_NAME}, an automated AI assistant calling from "
+    f"{COMPANY}. Is now a good time to talk?"
+)
+OUTBOUND_EXTRA_PROMPT = (
+    "\nYou placed this call, they did not call you. Open by saying who you are "
+    "and why you are calling. If they say it is a bad time, ask to be told when "
+    "to call back and end politely. If they ask to be removed from the list or "
+    "say do not call, confirm you will pass that on and end the call politely. "
+    "Never argue or try again after they decline."
+)
+
+# AudioSocket's only metadata is the 16-byte UUID, so it is how the dialplan tells
+# us which direction the call is. Keep in sync with asterisk/extensions_ai.conf
+# (5000, inbound) and asterisk/extensions_ai_outbound.conf (5001, outbound).
+CALL_PROFILES = {
+    "11111111222233334444555555555555": "inbound",
+    "22222222333344445555666666666666": "outbound",
+}
+DEFAULT_DIRECTION = "inbound"
 MAX_TURNS = 12                     # conversation history cap (user+assistant pairs)
 
 # --- audio / telephony constants (AudioSocket is fixed at 8 kHz s16 mono)
@@ -354,10 +379,27 @@ class CallHandler(socketserver.BaseRequestHandler):
         self.barge = threading.Event()         # caller interrupted
         self.cancel = threading.Event()        # kill the in-flight worker
         self.stop = threading.Event()          # call is over
-        self.history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
+        self.history: list[dict] = []          # filled by _begin, once direction known
         self.worker: threading.Thread | None = None
         self.speak_started = 0.0
         self.barge_run = 0
+        self.direction: str | None = None
+        self.frames_before_id = 0
+
+    def _begin(self, direction: str) -> None:
+        """Start the conversation. Deferred until the AudioSocket ID frame tells us
+        the direction, because inbound and outbound need different opening lines."""
+        if self.direction is not None:
+            return
+        self.direction = direction
+        prompt = SYSTEM_PROMPT
+        greeting = GREETING
+        if direction == "outbound":
+            prompt += OUTBOUND_EXTRA_PROMPT
+            greeting = OUTBOUND_GREETING
+        self.history = [{"role": "system", "content": prompt}]
+        log.info("call direction: %s", direction)
+        self.say(greeting)
 
     # -- outbound: pace frames at 20 ms so barge-in can actually cut us off
     def _sender(self) -> None:
@@ -486,6 +528,15 @@ class CallHandler(socketserver.BaseRequestHandler):
         pcm = np.frombuffer(payload, dtype=np.int16)
         self.vad.observe(pcm)          # always, so barge-in keeps its pre-roll
 
+        # Asterisk normally sends the ID frame before any audio. If a build ever
+        # does not, fall back rather than sitting mute for the whole call.
+        if self.direction is None:
+            self.frames_before_id += 1
+            if self.frames_before_id > 25:     # 500 ms of audio and still no ID
+                log.warning("no ID frame; assuming %s", DEFAULT_DIRECTION)
+                self._begin(DEFAULT_DIRECTION)
+            return
+
         if self.speaking.is_set():
             # barge-in: stricter threshold + a grace window, so the tail of our
             # own audio (or acoustic echo at the far end) cannot interrupt us
@@ -517,7 +568,7 @@ class CallHandler(socketserver.BaseRequestHandler):
         peer = self.client_address
         log.info("call from %s", peer)
         threading.Thread(target=self._sender, name="send", daemon=True).start()
-        self.say(GREETING)
+        # No greeting yet: _begin() fires once the ID frame reveals the direction.
         try:
             while not self.stop.is_set():
                 header = self._recv_exact(3)
@@ -533,6 +584,7 @@ class CallHandler(socketserver.BaseRequestHandler):
                 elif kind == KIND_ID:
                     self.uuid = payload.hex()
                     log.info("call uuid %s", self.uuid)
+                    self._begin(CALL_PROFILES.get(self.uuid, DEFAULT_DIRECTION))
                 elif kind == KIND_HANGUP:
                     log.info("hangup")
                     break

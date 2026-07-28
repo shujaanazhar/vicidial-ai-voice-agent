@@ -45,6 +45,9 @@ CLIPS = {
     # "didn't catch that" and never reach the LLM, which otherwise invents
     # "it seems our conversation has ended".
     "ai_test5": "Moment.",
+    # P4b: the simulated lead answering an outbound call. The agent speaks first
+    # on outbound, so this is a reply, not an opener.
+    "ai_test6": "Yes, speaking. What is this about?",
 }
 
 

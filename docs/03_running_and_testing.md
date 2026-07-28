@@ -85,6 +85,60 @@ USER (3.5s audio, stt 0.32s): So, are you an AI bot or a real person?
 AGENT (first audio +0.30s): I'm an artificial intelligence voice assistant for Teravox.
 ```
 
+## 3b. Outbound calls (P4b)
+
+Inbound is a call arriving at ext 5000. **Outbound is the reverse**: we place the
+call, and when the lead answers, Asterisk sends the answered channel to ext 5001,
+which hands it to the agent. The agent speaks first, because it rang them.
+
+Install the outbound dialplan the same way:
+
+```bash
+scp asterisk/extensions_ai_outbound.conf root@192.168.122.10:/etc/asterisk/
+ssh root@192.168.122.10 '
+  grep -q extensions_ai_outbound.conf /etc/asterisk/extensions.conf \
+    || echo "#include extensions_ai_outbound.conf" >> /etc/asterisk/extensions.conf
+  asterisk -rx "dialplan reload"'
+```
+
+Then place calls with the dialer:
+
+```bash
+# against the scripted answerer, no human needed
+host_ai/outbound.py --tunnel --to Local/6100@ai-outbound-test
+
+# to the real softphone (you have to pick up)
+host_ai/outbound.py --tunnel --to SIP/aitest
+
+# a small sequential campaign
+host_ai/outbound.py --tunnel --to Local/6100@ai-outbound-test --count 3
+```
+
+It reports a per-call outcome — `answered`, `busy`, `no answer`, `failed` — which
+is the whole reason it speaks AMI rather than shelling out to `asterisk -rx`.
+
+**`--tunnel` forwards AMI over SSH. Do not open port 5038 on the VM instead.**
+ViciBox's firewalld carries enormous geoblock ipsets; a `firewall-cmd --reload`
+times out on dbus, leaves firewalld in state `failed`, and installs a deny-all
+nftables ruleset that locks you out of the VM completely — SSH, HTTP and ping all
+gone. Recovering means driving the console with `virsh send-key` to run
+`nft flush ruleset`. The tunnel needs no firewall change at all.
+
+### How the agent knows which direction a call is
+
+AudioSocket passes the server exactly one piece of metadata: the 16-byte UUID.
+Channel variables do not cross it. So direction is encoded in the UUID, and
+`CALL_PROFILES` in `ai_agent.py` maps it:
+
+| Direction | Extension | UUID |
+|---|---|---|
+| inbound | 5000 | `11111111-2222-3333-4444-555555555555` |
+| outbound | 5001 | `22222222-3333-4444-5555-666666666666` |
+
+This matters because outbound must open the conversation and disclose that it is
+an automated AI call up front, which is a legal requirement for outbound dialing
+in many jurisdictions. Keep the dialplan UUIDs and `CALL_PROFILES` in sync.
+
 ## 4. Test with a real voice
 
 See `02_softphone_setup.md`. Start the agent, then `baresip`, then
