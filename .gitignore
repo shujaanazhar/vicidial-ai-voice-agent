@@ -1,0 +1,20 @@
+# Python venv — 2.6 GB, rebuilt by scripts/setup_host_ai.sh
+host_ai/.venv/
+__pycache__/
+*.py[cod]
+
+# Piper voice models — ~61 MB, downloaded by scripts/setup_host_ai.sh
+host_ai/piper_voices/*.onnx
+host_ai/piper_voices/*.onnx.json
+
+# Generated test audio (regenerate with scripts/make_test_audio.py)
+*.wav
+*.ppm
+
+# VM images and ISOs never belong in git
+*.qcow2
+*.iso
+
+# Local notes / scratch
+scratch/
+*.log

@@ -1,0 +1,18 @@
+# Host-side Python deps for the AI voice agent.
+# Installed into host_ai/.venv by scripts/setup_host_ai.sh.
+# These are the exact versions this project was built and tested against
+# (Ubuntu 24.04, Python 3.12, CUDA 12, RTX 4060 8 GB).
+
+faster-whisper==1.2.1     # STT, runs on GPU via CTranslate2
+piper-tts==1.5.0          # TTS, runs on CPU via onnxruntime
+av==18.0.0                # libswresample bindings — telephony resampling
+httpx==0.28.1             # streaming HTTP client for the Ollama API
+numpy==2.5.1
+soundfile==0.14.0         # only needed for offline audio inspection
+
+# CUDA runtime libs that CTranslate2 needs (cuDNN 9.x). Unpinned on purpose:
+# let pip resolve whatever matches the installed ctranslate2 build.
+# NOTE: host_ai/run_agent.sh must put these on LD_LIBRARY_PATH or model init
+# fails with a cuDNN load error that looks like a GPU fault.
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
