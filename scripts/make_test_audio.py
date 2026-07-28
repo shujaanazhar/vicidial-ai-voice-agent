@@ -37,6 +37,14 @@ CLIPS = {
     # Two traps: the "um" pause must not truncate the utterance, and the balance
     # must not be invented.
     "ai_test3": "Okay, so tell me what is, um, left on my account balance.",
+    # Proper nouns. Without initial_prompt, Whisper turned Teravox into
+    # "Ternomonts" and Alex into "Eric", and the LLM then answered sincerely
+    # about a company that does not exist.
+    "ai_test4": "Hi Alex, I would like to know what Teravox offers at the moment.",
+    # A single-word scrap, the kind barge-in leaves behind. Must get the canned
+    # "didn't catch that" and never reach the LLM, which otherwise invents
+    # "it seems our conversation has ended".
+    "ai_test5": "Moment.",
 }
 
 

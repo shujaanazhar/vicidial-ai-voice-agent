@@ -48,7 +48,9 @@ WHISPER_DEVICE = "cuda"
 WHISPER_COMPUTE = "float16"
 
 OLLAMA_URL = "http://localhost:11434"
-OLLAMA_MODEL = "llama3.2:3b"
+OLLAMA_MODEL = "qwen2.5:7b"        # llama3.2:3b is faster but invented facts with
+                                   # total confidence and only half-obeyed the
+                                   # prompt's no-fake-capabilities rule
 OLLAMA_KEEP_ALIVE = "30m"          # never let it cold-load mid-call (~30 s hit)
 
 AGENT_NAME = "Alex"
@@ -69,9 +71,30 @@ SYSTEM_PROMPT = (
     "- Never use lists, markdown, emoji, bullet points or stage directions.\n"
     "- Never invent facts about the caller, their account, prices, hours or orders. "
     "If you do not know, say so and offer to pass them to a person.\n"
-    "- You cannot transfer, hold, hang up, or look anything up. Do not pretend to.\n"
-    "- If you did not understand, ask them to repeat."
+    "- You cannot transfer, hold, hang up, search, or look anything up. Never offer to.\n"
+    "- If the caller's words are unclear or fragmentary, say only that you did not "
+    "catch it and ask them to repeat. NEVER guess that the call has ended, that they "
+    "hung up, or narrate the state of the conversation."
 )
+
+# Whisper substitutes phonetically plausible words for names it has never seen:
+# live testing turned "Teravox" into "Ternomonts" and "Alex" into "Eric", and the
+# LLM then answered sincerely about "Ternomonts". Seeding the decoder with the
+# domain vocabulary fixes it. Keep this short and natural — a long or list-like
+# initial_prompt makes Whisper leak it into the transcript.
+STT_VOCAB_PROMPT = f"This is a call with {AGENT_NAME} at {COMPANY}."
+
+# Sub-2-word transcripts are usually barge-in scraps rather than speech. These are
+# the short replies that ARE meaningful, so we do not ask people to repeat "yes".
+MEANINGFUL_SHORT = {
+    "yes", "yeah", "yep", "no", "nope", "bye", "goodbye", "thanks", "thank",
+    "hello", "hi", "hey", "sure", "okay", "ok", "correct", "right", "what",
+    "repeat", "again", "sorry", "please", "wait", "stop", "help",
+}
+DIDNT_CATCH = "Sorry, I didn't catch that. Could you say it again?"
+MAX_REPLY_SENTENCES = 2            # it ran to four on a phone call otherwise
+MAX_REPLY_CHARS = 320              # backstop for a comma-spliced ramble that never
+                                   # reaches a full stop
 GREETING = f"Hi, this is {AGENT_NAME}, an AI assistant at {COMPANY}. How can I help?"
 MAX_TURNS = 12                     # conversation history cap (user+assistant pairs)
 
@@ -170,7 +193,8 @@ class Models:
         audio = resample(pcm8k, RATE, STT_RATE).astype(np.float32) / 32768.0
         with self._stt_lock:
             segs, _ = self.stt.transcribe(audio, language="en", beam_size=1,
-                                          vad_filter=False)
+                                          vad_filter=False,
+                                          initial_prompt=STT_VOCAB_PROMPT)
             return " ".join(s.text for s in segs).strip()
 
     # -- LLM (streaming)
@@ -178,7 +202,7 @@ class Models:
         with self.http.stream("POST", f"{OLLAMA_URL}/api/chat", json={
             "model": OLLAMA_MODEL, "messages": messages,
             "stream": True, "keep_alive": OLLAMA_KEEP_ALIVE,
-            "options": {"temperature": 0.6, "num_predict": 120},
+            "options": {"temperature": 0.6, "num_predict": 60},
         }) as r:
             for line in r.iter_lines():
                 if cancel.is_set():
@@ -399,6 +423,17 @@ class CallHandler(socketserver.BaseRequestHandler):
             return
         log.info("USER (%.1fs audio, stt %.2fs): %s", dur, time.time() - t0, text)
 
+        # Short scraps are usually barge-in debris, not speech. Answer them here
+        # rather than sending them to the LLM: given a fragment it invents a
+        # narrative ("it seems our conversation has ended") instead of following
+        # the prompt's instruction to ask for a repeat. Handling it in code is
+        # both cheaper and more reliable than prompting.
+        words = re.findall(r"[a-z']+", text.lower())
+        if len(words) < 2 and not (words and words[0] in MEANINGFUL_SHORT):
+            log.info("AGENT (fragment, no LLM): %s", DIDNT_CATCH)
+            self.say(DIDNT_CATCH)
+            return
+
         self.history.append({"role": "user", "content": text})
         if len(self.history) > 1 + MAX_TURNS * 2:
             self.history = [self.history[0]] + self.history[-MAX_TURNS * 2:]
@@ -414,6 +449,15 @@ class CallHandler(socketserver.BaseRequestHandler):
                     first = time.time() - t0
                 reply_parts.append(sent)
                 self.say(sent)
+                # Count only chunks that actually END a sentence. sentences() also
+                # emits soft breaks on commas to get audio started sooner, and
+                # counting those cut a reply off mid-clause ("Would you like to
+                # pass that information along,") which sounds broken on a call.
+                done = sum(1 for s in reply_parts
+                           if s.rstrip().endswith((".", "!", "?")))
+                if done >= MAX_REPLY_SENTENCES or \
+                        sum(len(s) for s in reply_parts) >= MAX_REPLY_CHARS:
+                    break          # closes the generator, which closes the stream
         except Exception as exc:
             log.exception("llm failed: %s", exc)
             return
