@@ -139,6 +139,87 @@ This matters because outbound must open the conversation and disclose that it is
 an automated AI call up front, which is a legal requirement for outbound dialing
 in many jurisdictions. Keep the dialplan UUIDs and `CALL_PROFILES` in sync.
 
+## 3c. VICIdial integration (P5)
+
+Everything above bypasses VICIdial: the test peer sits in `context=ai-agent` and
+calls are placed by our own script. P5 connects the agent to VICIdial's own data,
+so a call knows **who** it is to and **why**, and its outcome lands back on the
+lead record.
+
+```bash
+bash scripts/setup_vicidial_ai.sh                  # idempotent
+scp asterisk/extensions_ai_outbound.conf root@192.168.122.10:/etc/asterisk/
+ssh root@192.168.122.10 'asterisk -rx "dialplan reload"'
+```
+
+That creates an API user (`aiagent`), campaign `AIOUT`, a script holding the call
+purpose, list `1001`, three leads, and the `AICOMP` / `AINOCO` dispositions.
+
+Run a campaign:
+
+```bash
+# unattended: the "leads" are the scripted answerer, nobody picks up
+host_ai/outbound.py --tunnel --campaign AIOUT --lead-context ai-lead-dial-sim --count 3
+
+# real: each lead's number rings the softphone, you answer
+host_ai/outbound.py --tunnel --campaign AIOUT --count 1
+```
+
+A grounded call looks like this — note the agent greets by name and city from the
+CRM rather than inventing an opening:
+
+```
+lead 8: Ayesha Khan (9001)
+call direction: outbound
+USER: Yes, speaking. What is this about?
+AGENT: Hello Ayesha Khan in Lahore. This is Alex from Teravox.
+disposition lead=8 status=AICOMP -> ok
+```
+
+and afterwards, in VICIdial:
+
+```
+lead_id  status   comments
+8        AICOMP   AI call, 1 caller turn(s). caller: Yes, speaking... | agent: Hello Ayesha...
+```
+
+### How the lead reaches the agent
+
+AudioSocket passes the server **only** the 16-byte UUID, and channel variables do
+not cross it. So the `lead_id` rides in the UUID's last segment:
+
+```
+inbound   11111111-2222-3333-4444-555555555555
+outbound  22222222-3333-4444-5555-<lead_id as 12 hex digits>
+```
+
+`outbound.py` builds it, passes it as the `AI_UUID` channel variable on the
+Originate, ext 5001 feeds it to `AudioSocket()`, and the agent decodes it. No side
+channel and no shared state to fall out of sync.
+
+**Direction must therefore be matched by PREFIX, not by exact UUID.** An
+exact-match table classified every campaign call as *inbound*, which silently
+skipped both the lead lookup and the write-back — the call worked, it just was not
+integrated with anything.
+
+### VICIdial API gotchas that cost real time
+
+- **The Non-Agent API gates on two independent layers.** `api_allowed_functions`
+  must list the function, *and* each function checks its own columns.
+  `lead_search` alone needs `vdc_agent_api_access='1'`,
+  `modify_leads IN('1'..'5')` and `user_level > 7`. Satisfy only the first and you
+  get a bare `USER DOES NOT HAVE PERMISSION` that never says which flag is missing.
+- **Those permission columns are ENUMs** like `enum('0','1')`. Assigning the
+  *integer* `1` selects the **first** enum element, which is `'0'` — the opposite
+  of what you meant. Quote them.
+- **`vicidial_statuses.status` is `varchar(6)`.** Longer codes are silently
+  truncated (`AINOCON` became `AINOCO`), so the agent then writes a status that
+  does not match any defined one.
+- `add_user` via the API needs a permission the stock admin lacks, so the setup
+  script creates the API user directly in the database.
+- `stage=json` on any function returns parseable JSON instead of positional
+  pipe-delimited text. Use it.
+
 ## 4. Test with a real voice
 
 See `02_softphone_setup.md`. Start the agent, then `baresip`, then

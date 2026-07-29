@@ -34,6 +34,8 @@ import numpy as np
 from faster_whisper import WhisperModel
 from piper import PiperVoice
 
+import vicidial
+
 # ---------------------------------------------------------------- config
 
 HOST, PORT = "0.0.0.0", 8090
@@ -118,9 +120,34 @@ OUTBOUND_EXTRA_PROMPT = (
 # (5000, inbound) and asterisk/extensions_ai_outbound.conf (5001, outbound).
 CALL_PROFILES = {
     "11111111222233334444555555555555": "inbound",
-    "22222222333344445555666666666666": "outbound",
+    "22222222333344445555666666666666": "outbound",   # outbound, no lead attached
 }
 DEFAULT_DIRECTION = "inbound"
+
+
+def direction_for_uuid(uuid_hex: str) -> str:
+    """Classify a call from its AudioSocket UUID.
+
+    Must be a PREFIX test, not a dict lookup: P5 encodes the lead_id in the UUID's
+    last segment, so every campaign call has a different UUID. An exact-match table
+    silently classified those as inbound, which skipped the lead lookup and the
+    disposition write-back entirely.
+    """
+    bare = uuid_hex.replace("-", "").lower()
+    if bare in CALL_PROFILES:
+        return CALL_PROFILES[bare]
+    if bare.startswith(vicidial.OUTBOUND_UUID_PREFIX.replace("-", "")):
+        return "outbound"
+    return DEFAULT_DIRECTION
+
+# P5: which VICIdial campaign these outbound calls belong to, and what to write
+# back when the call ends. Statuses are created by scripts/setup_vicidial_ai.sh.
+VICI_CAMPAIGN = "AIOUT"
+VICI_ENABLED = True                # set False to run the agent with no CRM at all
+STATUS_COMPLETED = "AICOMP"        # a real conversation happened
+STATUS_NO_CONVO = "AINOCO"        # answered but nothing usable was said.
+                                   # NOTE: vicidial_statuses.status is varchar(6),
+                                   # longer codes are silently TRUNCATED.
 MAX_TURNS = 12                     # conversation history cap (user+assistant pairs)
 
 # --- audio / telephony constants (AudioSocket is fixed at 8 kHz s16 mono)
@@ -385,21 +412,52 @@ class CallHandler(socketserver.BaseRequestHandler):
         self.barge_run = 0
         self.direction: str | None = None
         self.frames_before_id = 0
+        self.lead: vicidial.Lead | None = None
+        self.transcript: list[str] = []     # "caller:"/"agent:" lines, for write-back
 
     def _begin(self, direction: str) -> None:
         """Start the conversation. Deferred until the AudioSocket ID frame tells us
-        the direction, because inbound and outbound need different opening lines."""
+        the direction, because inbound and outbound need different opening lines
+        and outbound also needs the CRM record behind the call."""
         if self.direction is not None:
             return
         self.direction = direction
         prompt = SYSTEM_PROMPT
         greeting = GREETING
+
         if direction == "outbound":
             prompt += OUTBOUND_EXTRA_PROMPT
             greeting = OUTBOUND_GREETING
+            # The lead_id rides in the AudioSocket UUID (see vicidial.py). Pulling
+            # the record is what stops the model inventing a reason for calling.
+            lead_id = vicidial.lead_id_from_uuid(self.uuid)
+            if lead_id and VICI_ENABLED:
+                self.lead = VICI.get_lead(lead_id)
+                if self.lead:
+                    log.info("lead %s: %s (%s)", self.lead.lead_id,
+                             self.lead.name or "?", self.lead.phone_number)
+                    prompt += self.lead.prompt_block(
+                        VICI.campaign_purpose(VICI_CAMPAIGN))
+                    if self.lead.name:
+                        greeting = (
+                            f"Hello, is that {self.lead.name}? This is {AGENT_NAME}, "
+                            f"an automated AI assistant calling from {COMPANY}.")
+                else:
+                    log.warning("lead %s not retrievable; continuing ungrounded",
+                                lead_id)
+
         self.history = [{"role": "system", "content": prompt}]
         log.info("call direction: %s", direction)
         self.say(greeting)
+
+    def _write_back(self) -> None:
+        """Push the outcome to VICIdial so the call exists outside our log file."""
+        if not (VICI_ENABLED and self.lead):
+            return
+        turns = sum(1 for line in self.transcript if line.startswith("caller:"))
+        status = STATUS_COMPLETED if turns else STATUS_NO_CONVO
+        note = f"AI call, {turns} caller turn(s). " + " | ".join(self.transcript)
+        VICI.set_disposition(self.lead.lead_id, status, note)
 
     # -- outbound: pace frames at 20 ms so barge-in can actually cut us off
     def _sender(self) -> None:
@@ -464,6 +522,7 @@ class CallHandler(socketserver.BaseRequestHandler):
             log.info("stt: (nothing usable) %.1fs audio", dur)
             return
         log.info("USER (%.1fs audio, stt %.2fs): %s", dur, time.time() - t0, text)
+        self.transcript.append(f"caller: {text}")
 
         # Short scraps are usually barge-in debris, not speech. Answer them here
         # rather than sending them to the LLM: given a fragment it invents a
@@ -506,6 +565,7 @@ class CallHandler(socketserver.BaseRequestHandler):
         if reply_parts and not cancel.is_set():
             reply = " ".join(reply_parts)
             self.history.append({"role": "assistant", "content": reply})
+            self.transcript.append(f"agent: {reply}")
             log.info("AGENT (first audio +%.2fs): %s", first or 0.0, reply)
 
     def _start_worker(self, pcm: np.ndarray) -> None:
@@ -584,7 +644,7 @@ class CallHandler(socketserver.BaseRequestHandler):
                 elif kind == KIND_ID:
                     self.uuid = payload.hex()
                     log.info("call uuid %s", self.uuid)
-                    self._begin(CALL_PROFILES.get(self.uuid, DEFAULT_DIRECTION))
+                    self._begin(direction_for_uuid(self.uuid))
                 elif kind == KIND_HANGUP:
                     log.info("hangup")
                     break
@@ -595,6 +655,10 @@ class CallHandler(socketserver.BaseRequestHandler):
         finally:
             self.stop.set()
             self.cancel.set()
+            try:
+                self._write_back()
+            except Exception as exc:          # never let CRM trouble mask a hangup
+                log.exception("write-back failed: %s", exc)
             log.info("call ended %s", peer)
 
 
@@ -605,6 +669,10 @@ class Server(socketserver.ThreadingTCPServer):
 
 if __name__ == "__main__":
     MODELS = Models()
+    VICI = vicidial.Vicidial() if VICI_ENABLED else None
+    if VICI_ENABLED:
+        log.info("vicidial API at %s as %s", vicidial.VICI_HOST,
+                 vicidial.VICI_API_USER)
     log.info("AI agent listening on %s:%d", HOST, PORT)
     with Server((HOST, PORT), CallHandler) as srv:
         try:

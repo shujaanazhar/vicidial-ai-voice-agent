@@ -105,10 +105,12 @@ docs/02_softphone_setup.md       baresip as the simulated customer
 docs/03_running_and_testing.md   dialplan install, running, tests, latency
 scripts/setup_host_ai.sh         installs Ollama + model, faster-whisper, Piper
 scripts/make_test_audio.py       generates the simulated-caller WAVs
+scripts/setup_vicidial_ai.sh     P5: API user, campaign, script, list, leads, statuses
 requirements.txt                 pinned host Python deps
 host_ai/ai_agent.py              the agent: VAD→STT→LLM→TTS + barge-in
 host_ai/run_agent.sh             launcher (sets the LD_LIBRARY_PATH CTranslate2 needs)
-host_ai/outbound.py              P4b outbound dialer: AMI Originate + call outcomes
+host_ai/outbound.py              P4b/P5 dialer: AMI Originate, VICIdial campaigns, outcomes
+host_ai/vicidial.py              P5 VICIdial Non-Agent API client: lead context + dispositions
 host_ai/audiosocket_echo.py      echo server — proves the audio pipe in isolation
 asterisk/extensions_ai.conf      dialplan: route inbound ext 5000 to AudioSocket
 asterisk/extensions_ai_outbound.conf  dialplan: outbound ext 5001 + scripted answerer
@@ -127,7 +129,7 @@ asterisk/sip_ai_test.conf        chan_sip peer for the test softphone
 | P3 | AI pipeline: VAD→STT→LLM→TTS + barge-in | **done** |
 | P4a | **Inbound** feature: inbound route → AI answers | **done** — ext 5000 |
 | P4b | **Outbound** feature: Originate/dialer → bridge AI | **done** — `host_ai/outbound.py`, ext 5001 |
-| P5 | Wire into VICIdial (in-groups, campaigns, dispositions) | after P4 |
+| P5 | Wire into VICIdial (campaigns, lead context, dispositions) | **partly done** — campaigns, lead grounding and write-back work; in-group inbound routing and human transfer remain |
 
 ## Measured latency
 
@@ -160,10 +162,11 @@ whole reply already sitting in Asterisk's buffer).
 - The agent offers to "pass you to a representative" but cannot yet — that
   arrives with P5.
 - English only (`small.en`, `en_US-lessac-medium`).
-- **Outbound invents a reason for calling.** The opening line is fixed, but the
-  model's follow-up made up a pretext ("I called to check in on your account").
-  The call's purpose has to be injected from campaign/lead data, not left to the
-  model. That arrives with P5.
+- **Inbound is not yet VICIdial-native.** Outbound now runs off real campaigns and
+  leads, but inbound still arrives at ext 5000 directly rather than through a
+  VICIdial in-group, and there is no transfer to a human agent.
+- **Only one call at a time is really tested.** The Whisper and Piper instances are
+  shared behind locks, so concurrent calls will serialise on the GPU.
 
 ## Security note
 
