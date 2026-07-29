@@ -202,6 +202,67 @@ exact-match table classified every campaign call as *inbound*, which silently
 skipped both the lead lookup and the write-back — the call worked, it just was not
 integrated with anything.
 
+### Transfer to a human
+
+A caller asking for a person is handled **deterministically from the transcript,
+before the LLM is consulted** — it is the one request that must never be missed,
+and this model has already shown it only half-obeys instructions.
+
+```bash
+# unattended: the "human" is a recording
+AI_TRANSFER_EXTEN=7001 host_ai/run_agent.sh
+ssh root@192.168.122.10 'asterisk -rx "channel originate Local/5000@ai-agent extension 6004@ai-test"'
+```
+
+```
+USER: This is not helping. Can I speak to a real person please?
+transfer intent detected
+TRANSFER Local/5000@ai-agent-00000008;2 -> ai-transfer,7001,1 : ok
+```
+
+Measured at ~320 ms from transcript to redirect, and the dialplan's
+"connecting you" prompt covers it.
+
+**How it works, and why it has to.** `AudioSocket()` is a terminal application:
+while it runs the channel is stuck inside it, and the protocol gives the server no
+way to set a channel variable or hand a decision back to the dialplan. So the AI
+cannot *return* a transfer. Instead it reaches into Asterisk and moves the channel:
+
+```
+asterisk -rx "channel redirect <channel> ai-transfer,7000,1"
+```
+
+That yanks the channel out of AudioSocket — our socket closes, which is how the
+agent learns the call left — and lands it in `[ai-transfer]`, which announces and
+dials the human.
+
+The channel *name* is not in the protocol either. So the dialplan stashes it in
+Asterisk's own database before entering AudioSocket, keyed by the UUID:
+
+```
+same => n,Set(DB(aiagent/${AI_SOCK_UUID})=${CHANNEL})
+```
+
+and the agent reads it back with `database get`. No side channel, no channel
+enumeration, nothing to go stale.
+
+Two deliberate choices:
+
+- **SSH + `asterisk -rx`, not AMI.** A transfer is one action. A long-lived agent
+  holding an AMI socket through an SSH tunnel that can die would need reconnect
+  logic for no benefit.
+- **The dialplan does the announcing, not the agent.** Once redirected our audio
+  path is gone, so anything still queued on our side would be cut off mid-word.
+
+**`"are you a real person?"` must NOT transfer.** It is a question *about* the
+agent, not a request for one, and it is exactly what callers ask to check whether
+they reached a bot. `IDENTITY_QUESTION` suppresses the transfer so honest
+disclosure still happens; 11 phrasings are covered, and ext 6002 regresses it.
+
+In production the `Dial()` in `[ai-transfer]` should hand off to a VICIdial
+in-group so a logged-in agent gets the call with the lead on screen. That is a
+change to one dialplan line, not to any code.
+
 ### VICIdial API gotchas that cost real time
 
 - **The Non-Agent API gates on two independent layers.** `api_allowed_functions`

@@ -114,6 +114,7 @@ host_ai/vicidial.py              P5 VICIdial Non-Agent API client: lead context 
 host_ai/audiosocket_echo.py      echo server — proves the audio pipe in isolation
 asterisk/extensions_ai.conf      dialplan: route inbound ext 5000 to AudioSocket
 asterisk/extensions_ai_outbound.conf  dialplan: outbound ext 5001 + scripted answerer
+asterisk/extensions_ai_transfer.conf  dialplan: hand a live call to a human
 asterisk/extensions_ai_test.conf test harness: drive the agent with no softphone
 asterisk/sip_ai_test.conf        chan_sip peer for the test softphone
 ```
@@ -129,7 +130,7 @@ asterisk/sip_ai_test.conf        chan_sip peer for the test softphone
 | P3 | AI pipeline: VAD→STT→LLM→TTS + barge-in | **done** |
 | P4a | **Inbound** feature: inbound route → AI answers | **done** — ext 5000 |
 | P4b | **Outbound** feature: Originate/dialer → bridge AI | **done** — `host_ai/outbound.py`, ext 5001 |
-| P5 | Wire into VICIdial (campaigns, lead context, dispositions) | **partly done** — campaigns, lead grounding and write-back work; in-group inbound routing and human transfer remain |
+| P5 | Wire into VICIdial (campaigns, lead context, dispositions, transfer) | **mostly done** — campaigns, lead grounding, write-back and transfer-to-human all work; in-group inbound routing remains |
 
 ## Measured latency
 
@@ -162,9 +163,10 @@ whole reply already sitting in Asterisk's buffer).
 - The agent offers to "pass you to a representative" but cannot yet — that
   arrives with P5.
 - English only (`small.en`, `en_US-lessac-medium`).
-- **Inbound is not yet VICIdial-native.** Outbound now runs off real campaigns and
+- **Inbound is not yet VICIdial-native.** Outbound runs off real campaigns and
   leads, but inbound still arrives at ext 5000 directly rather than through a
-  VICIdial in-group, and there is no transfer to a human agent.
+  VICIdial in-group. Transfer works but dials a plain SIP peer rather than handing
+  off to an in-group with the lead on the agent's screen.
 - **Only one call at a time is really tested.** The Whisper and Piper instances are
   shared behind locks, so concurrent calls will serialise on the GPU.
 

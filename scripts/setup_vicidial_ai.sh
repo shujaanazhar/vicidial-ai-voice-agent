@@ -92,6 +92,9 @@ ON DUPLICATE KEY UPDATE status_name=VALUES(status_name);
 INSERT INTO vicidial_statuses (status, status_name, selectable, human_answered, category, sale, dnc, customer_contact, not_interested, unworkable, scheduled_callback, completed)
 VALUES ('AINOCO', 'AI call - answered, no conversation', 'Y', 'Y', 'UNDEFINED', 'N', 'N', 'N', 'N', 'N', 'N', 'Y')
 ON DUPLICATE KEY UPDATE status_name=VALUES(status_name);
+INSERT INTO vicidial_statuses (status, status_name, selectable, human_answered, category, sale, dnc, customer_contact, not_interested, unworkable, scheduled_callback, completed)
+VALUES ('AIXFER', 'AI call - transferred to human', 'Y', 'Y', 'UNDEFINED', 'N', 'N', 'Y', 'N', 'N', 'N', 'N')
+ON DUPLICATE KEY UPDATE status_name=VALUES(status_name);
 SELECT status, status_name, human_answered, completed FROM vicidial_statuses WHERE status LIKE 'AI%';
 SQL
 

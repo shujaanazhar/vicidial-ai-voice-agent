@@ -48,6 +48,12 @@ CLIPS = {
     # P4b: the simulated lead answering an outbound call. The agent speaks first
     # on outbound, so this is a reply, not an opener.
     "ai_test6": "Yes, speaking. What is this about?",
+    # P5 transfer path (asterisk/extensions_ai_transfer.conf).
+    "ai_transfer": "Thanks, connecting you to a colleague now. One moment.",
+    "ai_noagent": "Sorry, nobody is free right now. Someone will call you back.",
+    "ai_human": "Hello, this is Sana from the support team. How can I help?",
+    # A caller asking for a person, to exercise transfer intent detection.
+    "ai_test7": "This is not helping. Can I speak to a real person please?",
 }
 
 

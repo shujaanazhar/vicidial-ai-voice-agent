@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import re
 import socketserver
 import struct
+import subprocess
 import threading
 import time
 from collections import deque
@@ -145,10 +147,41 @@ def direction_for_uuid(uuid_hex: str) -> str:
 VICI_CAMPAIGN = "AIOUT"
 VICI_ENABLED = True                # set False to run the agent with no CRM at all
 STATUS_COMPLETED = "AICOMP"        # a real conversation happened
+STATUS_TRANSFERRED = "AIXFER"      # handed off to a human
 STATUS_NO_CONVO = "AINOCO"        # answered but nothing usable was said.
                                    # NOTE: vicidial_statuses.status is varchar(6),
                                    # longer codes are silently TRUNCATED.
 MAX_TURNS = 12                     # conversation history cap (user+assistant pairs)
+
+# --- transfer to a human (P5) ---------------------------------------------
+# Detected deterministically from the caller's own words rather than asking the
+# model to decide. "I want a real person" is the one request that must never be
+# missed, and this model has already proved it half-obeys instructions.
+TRANSFER_INTENT = re.compile(
+    r"\b(?:real|actual|live|human)\s+(?:person|human|being|agent|operator)\b"
+    r"|\b(?:speak|talk)\s+(?:to|with)\s+(?:a\s+|an\s+|someone\s+)?"
+    r"(?:human|person|agent|operator|someone|somebody|manager|supervisor)\b"
+    r"|\btransfer\s+me\b|\bput\s+me\s+through\b"
+    r"|\bget\s+me\s+(?:a\s+)?(?:human|person|manager|supervisor|agent)\b"
+    r"|\bstop\s+(?:the\s+)?(?:bot|robot)\b",
+    re.I)
+
+# ...but "are you a real person?" is a question ABOUT the agent, not a request for
+# one, and it is exactly what callers ask when checking whether they reached a bot.
+# Treating it as a transfer request would both hang up on the honest-disclosure
+# answer and break regression test 6002.
+IDENTITY_QUESTION = re.compile(
+    r"\b(?:are|is|am)\s+(?:you|this|i)\b[^.?!]*"
+    r"\b(?:real\s+person|real\s+human|human|bot|robot|ai|machine|computer)\b",
+    re.I)
+
+TRANSFER_ENABLED = True
+TRANSFER_CONTEXT = "ai-transfer"
+# 7000 rings a real SIP agent; 7001 is the unattended simulated one. Override with
+# AI_TRANSFER_EXTEN so tests do not need a human logged in anywhere.
+TRANSFER_EXTEN = os.environ.get("AI_TRANSFER_EXTEN", "7000")
+VM_SSH = os.environ.get("AI_VM_SSH", "root@192.168.122.10")
+ASTDB_FAMILY = "aiagent"           # dialplan writes DB(aiagent/<uuid>)=${CHANNEL}
 
 # --- audio / telephony constants (AudioSocket is fixed at 8 kHz s16 mono)
 RATE = 8000
@@ -414,6 +447,7 @@ class CallHandler(socketserver.BaseRequestHandler):
         self.frames_before_id = 0
         self.lead: vicidial.Lead | None = None
         self.transcript: list[str] = []     # "caller:"/"agent:" lines, for write-back
+        self.transferred = False
 
     def _begin(self, direction: str) -> None:
         """Start the conversation. Deferred until the AudioSocket ID frame tells us
@@ -455,9 +489,60 @@ class CallHandler(socketserver.BaseRequestHandler):
         if not (VICI_ENABLED and self.lead):
             return
         turns = sum(1 for line in self.transcript if line.startswith("caller:"))
-        status = STATUS_COMPLETED if turns else STATUS_NO_CONVO
+        if self.transferred:
+            status = STATUS_TRANSFERRED
+        else:
+            status = STATUS_COMPLETED if turns else STATUS_NO_CONVO
         note = f"AI call, {turns} caller turn(s). " + " | ".join(self.transcript)
         VICI.set_disposition(self.lead.lead_id, status, note)
+
+    # -- transfer to a human
+    def _ast(self, cli: str, timeout: float = 6.0) -> str:
+        """Run one Asterisk CLI command on the VM over SSH.
+
+        Deliberately not AMI: a transfer is a single one-off action, and a
+        long-lived agent holding an AMI socket (through an SSH tunnel that can die)
+        would need reconnect logic for no benefit. The ~200 ms of SSH is hidden
+        behind the dialplan's own "connecting you" prompt.
+        """
+        out = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=no",
+             "-o", "ConnectTimeout=4", VM_SSH, f"asterisk -rx {cli!r}"],
+            capture_output=True, text=True, timeout=timeout)
+        return out.stdout.strip()
+
+    def _do_transfer(self) -> bool:
+        """Move this channel out of AudioSocket and on to a human.
+
+        AudioSocket is a terminal application and passes nothing back, so the AI
+        cannot return a "transfer" decision to the dialplan. Instead we reach into
+        Asterisk and redirect the channel. The channel name is not in the protocol
+        either, so the dialplan stashed it in Asterisk's own DB keyed by the UUID.
+
+        Our socket then closes, which is how this call ends from our side. The
+        dialplan does the announcing, because once redirected our audio path is
+        gone and anything still queued here would be cut off mid-word.
+        """
+        formatted = self.uuid
+        if len(formatted) == 32:      # ID frame gives bare hex; AstDB key is dashed
+            formatted = "-".join([formatted[:8], formatted[8:12], formatted[12:16],
+                                  formatted[16:20], formatted[20:]])
+        try:
+            raw = self._ast(f"database get {ASTDB_FAMILY} {formatted}")
+            m = re.search(r"Value:\s*(\S+)", raw)
+            if not m:
+                log.warning("transfer: no channel in AstDB for %s (%s)", formatted, raw)
+                return False
+            channel = m.group(1)
+            res = self._ast(
+                f"channel redirect {channel} {TRANSFER_CONTEXT},{TRANSFER_EXTEN},1")
+        except (subprocess.SubprocessError, OSError) as exc:
+            log.warning("transfer failed: %s", exc)
+            return False
+        ok = "successfully redirected" in res.lower()
+        log.info("TRANSFER %s -> %s,%s,1 : %s", channel, TRANSFER_CONTEXT,
+                 TRANSFER_EXTEN, "ok" if ok else res[:120])
+        return ok
 
     # -- outbound: pace frames at 20 ms so barge-in can actually cut us off
     def _sender(self) -> None:
@@ -529,6 +614,20 @@ class CallHandler(socketserver.BaseRequestHandler):
         # narrative ("it seems our conversation has ended") instead of following
         # the prompt's instruction to ask for a repeat. Handling it in code is
         # both cheaper and more reliable than prompting.
+        # A request for a human takes priority over everything else, and is checked
+        # before the LLM so the model cannot talk the caller out of it.
+        if (TRANSFER_ENABLED and TRANSFER_INTENT.search(text)
+                and not IDENTITY_QUESTION.search(text)):
+            log.info("transfer intent detected: %s", text)
+            self.transcript.append("agent: [transferred to human]")
+            if self._do_transfer():
+                self.transferred = True
+                return
+            log.warning("transfer requested but failed; continuing with the AI")
+            self.say("Sorry, I could not put you through just now. "
+                     "I will keep helping if I can.")
+            return
+
         words = re.findall(r"[a-z']+", text.lower())
         if len(words) < 2 and not (words and words[0] in MEANINGFUL_SHORT):
             log.info("AGENT (fragment, no LLM): %s", DIDNT_CATCH)
